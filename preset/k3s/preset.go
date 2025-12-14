@@ -29,17 +29,19 @@
 package k3s
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net/http"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/docker/docker/client"
 	"github.com/orlangure/gnomock"
 	"github.com/orlangure/gnomock/internal/registry"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -272,43 +274,77 @@ func (p *P) setDefaults() {
 // ConfigBytes returns file contents of kubeconfig file that should be used to
 // connect to the cluster running in the provided container.
 func ConfigBytes(c *gnomock.Container) (configBytes []byte, err error) {
+
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, fmt.Errorf("failed to creating Docker client: %w", err)
+	}
+	defer cli.Close()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	url := fmt.Sprintf("http://%s/kubeconfig.yaml", c.Address(KubeConfigPortName))
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	configBytes, err = getFileBytesFromContainer(ctx, cli, c.ID, "/var/gnomock/kubeconfig.yaml")
 	if err != nil {
-		return nil, fmt.Errorf("kubeconfig unavailable: %w", err)
+		return nil, fmt.Errorf("failed to get k3s config from container as bytes: %w", err)
 	}
 
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("kubeconfig unavailable: %w", err)
-	}
+	/*
+		url := fmt.Sprintf("http://%s/kubeconfig.yaml", c.Address(KubeConfigPortName))
 
-	defer func() {
-		closeErr := res.Body.Close()
-		if err == nil && closeErr != nil {
-			err = closeErr
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("kubeconfig unavailable: %w", err)
 		}
-	}()
 
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("invalid kubeconfig response code '%d'", res.StatusCode)
-	}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("kubeconfig unavailable: %w", err)
+		}
 
-	configBytes, err = io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("can't read kubeconfig body: %w", err)
-	}
+		defer func() {
+			closeErr := res.Body.Close()
+			if err == nil && closeErr != nil {
+				err = closeErr
+			}
+		}()
 
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("invalid kubeconfig response code '%d'", res.StatusCode)
+		}
+
+		configBytes, err = io.ReadAll(res.Body)
+		if err != nil {
+			return nil, fmt.Errorf("can't read kubeconfig body: %w", err)
+		}
+	*/
 	configBytes = reServerAddress.ReplaceAll(
 		configBytes,
 		[]byte("https://"+c.DefaultAddress()),
 	)
 
 	return configBytes, nil
+}
+
+func getFileBytesFromContainer(ctx context.Context, cli *client.Client, containerID, srcPath string) ([]byte, error) {
+	reader, _, err := cli.CopyFromContainer(ctx, containerID, srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("error copying file from container: %w", err)
+	}
+	defer reader.Close()
+
+	tr := tar.NewReader(reader)
+	_, err = tr.Next()
+	if err != nil {
+		// If the path doesn't exist, this might return io.EOF or a specific Docker API error
+		return nil, fmt.Errorf("error reading tar header (file might not exist): %w", err)
+	}
+
+	buf := new(bytes.Buffer)
+	if _, err := io.Copy(buf, tr); err != nil {
+		return nil, fmt.Errorf("error reading file content into buffer: %w", err)
+	}
+
+	return buf.Bytes(), nil
 }
 
 // Config returns `*rest.Config` instance of Kubernetes client-go package. This
